@@ -1,0 +1,226 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Drive Safe Pro - IA Local de Vanguardia</title>
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-core"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-converter"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-backend-webgl"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/face-landmarks-detection"></script>
+    <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-slate-950 text-white min-h-screen flex flex-col items-center justify-between p-4 font-sans select-none">
+
+    <header class="w-full max-w-md flex justify-between items-center py-3 border-b border-slate-900">
+        <div class="flex flex-col">
+            <h1 class="text-lg font-black tracking-wider text-emerald-400">DRIVE SAFE <span class="text-[10px] bg-emerald-500/20 text-emerald-400 border border-emerald-500/30 px-2 py-0.5 rounded ml-1 font-bold">PRO IA</span></h1>
+            <p class="text-[10px] text-slate-500 font-medium">Monitoreo biométrico en tiempo real</p>
+        </div>
+        <div id="status" class="text-xs bg-amber-500/20 text-amber-400 border border-amber-500/30 px-3 py-1 rounded-full font-bold transition-all duration-300">
+            Cargando Modelo...
+        </div>
+    </header>
+
+    <main class="relative w-full max-w-md aspect-[3/4] bg-slate-900 rounded-3xl overflow-hidden border border-slate-800 shadow-2xl flex items-center justify-center mt-2">
+        <video id="webcam" autoplay playsinline muted class="absolute w-full h-full object-cover scale-x-[-1] opacity-60"></video>
+        <canvas id="output" class="absolute w-full h-full object-cover scale-x-[-1] z-10 hidden"></canvas>
+        
+        <div id="loading-placeholder" class="absolute flex flex-col items-center gap-3 z-20">
+            <div class="w-8 h-8 border-4 border-emerald-500 border-t-transparent rounded-full animate-spin"></div>
+            <p class="text-xs text-slate-400 font-medium tracking-wide">Configurando entorno de visión...</p>
+        </div>
+
+        <div id="alert-overlay" class="absolute inset-0 bg-red-600/90 hidden flex-col items-center justify-center animate-pulse z-30 backdrop-blur-sm">
+            <div class="bg-white/10 p-6 rounded-full border border-white/20 mb-4 shadow-xl">
+                <span class="text-6xl animate-bounce inline-block">🛑</span>
+            </div>
+            <h2 class="text-4xl font-black text-white tracking-widest text-center">¡DESPIERTA!<br><span class="text-sm font-light tracking-normal block mt-2 text-red-200">PELIGRO DE SOMNOLENCIA</span></h2>
+        </div>
+    </main>
+
+    <div id="calibration-toast" class="w-full max-w-md bg-blue-500/10 border border-blue-500/30 rounded-xl p-2 text-center text-xs text-blue-400 font-medium mt-2 hidden animate-fade-in">
+        ⏱️ Calibrando ojos... Mira al frente de manera normal.
+    </div>
+
+    <section class="w-full max-w-md bg-slate-900/50 border border-slate-800/60 rounded-2xl p-4 my-3 grid grid-cols-2 gap-4 backdrop-blur-md">
+        <div class="text-center bg-slate-950/80 p-3 rounded-xl border border-slate-800/40">
+            <p class="text-[10px] text-slate-500 uppercase font-bold tracking-wider">Estado Biométrico</p>
+            <p id="eye-metric" class="text-lg font-extrabold text-slate-400 mt-1 tracking-wide">ANALIZANDO...</p>
+        </div>
+        <div class="text-center bg-slate-950/80 p-3 rounded-xl border border-slate-800/40">
+            <p class="text-[10px] text-slate-500 uppercase font-bold tracking-wider">Latencia de Red</p>
+            <p id="fps" class="text-lg font-extrabold text-blue-400 mt-1">0 ms <span class="text-xs font-normal text-slate-500">/ frame</span></p>
+        </div>
+    </section>
+
+    <footer class="w-full max-w-md text-center pb-2">
+        <button id="audio-auth-btn" class="text-[11px] text-amber-400 bg-amber-500/10 border border-amber-500/20 px-4 py-1.5 rounded-lg font-medium hover:bg-amber-500/20 transition-all active:scale-95">
+            ⚠️ Activar permisos de audio de alarma
+        </button>
+        <p class="text-[10px] text-slate-600 mt-2 font-medium">Procesamiento 100% privado en el dispositivo.</p>
+    </footer>
+
+    <audio id="alarm-sound" src="https://actions.google.com/sounds/v1/alarms/digital_watch_alarm_long.ogg" loop></audio>
+
+    <script>
+        const video = document.getElementById('webcam');
+        const statusDiv = document.getElementById('status');
+        const eyeMetric = document.getElementById('eye-metric');
+        const alertOverlay = document.getElementById('alert-overlay');
+        const alarm = document.getElementById('alarm-sound');
+        const fpsDiv = document.getElementById('fps');
+        const audioBtn = document.getElementById('audio-auth-btn');
+        const loadingPlaceholder = document.getElementById('loading-placeholder');
+        const calibrationToast = document.getElementById('calibration-toast');
+
+        let model;
+        let alarmAllowed = false;
+        
+        // Variables de calibración dinámica adaptativa
+        let calibrationFrames = 0;
+        let maxCalibrationFrames = 60; // 2 segundos iniciales para medir la apertura normal del usuario
+        let eyeThreshold = 3.8; // Umbral base de seguridad por defecto
+        let collectedDistances = [];
+
+        // Desbloquear audio mediante interacción requerida por navegadores móviles
+        audioBtn.addEventListener('click', () => {
+            alarm.play().then(() => {
+                alarm.pause();
+                alarm.currentTime = 0;
+                alarmAllowed = true;
+                audioBtn.innerText = "🔊 Sonido de Alarma Verificado";
+                audioBtn.className = "text-[11px] text-emerald-400 bg-emerald-500/10 border border-emerald-500/20 px-4 py-1.5 rounded-lg font-medium cursor-default";
+            }).catch(e => console.error("Error al activar audio:", e));
+        });
+
+        // 1. Iniciar cámara eficientemente a baja resolución para ahorrar CPU/Batería
+        async function setupCamera() {
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({
+                    video: { 
+                        width: { ideal: 480 }, 
+                        height: { ideal: 360 }, 
+                        facingMode: "user" 
+                    },
+                    audio: false
+                });
+                video.srcObject = stream;
+                return new Promise((resolve) => video.onloadedmetadata = () => resolve(video));
+            } catch (err) {
+                statusDiv.innerText = "ERROR DE CÁMARA";
+                statusDiv.className = "text-xs bg-red-500 text-white px-3 py-1 rounded-full font-bold";
+                alert("Por favor, permite el acceso a la cámara frontal para usar la aplicación.");
+            }
+        }
+
+        // 2. Inicializar TensorFlow.js y el Detector
+        async function main() {
+            await tf.setBackend('webgl'); // Forzar aceleración por hardware gráfica (GPU móvil)
+            await setupCamera();
+            
+            statusDiv.innerText = "Cargando IA...";
+            loadingPlaceholder.style.display = 'flex';
+
+            model = await faceLandmarksDetection.createDetector(
+                faceLandmarksDetection.SupportedModels.MediaPipeFaceMesh, 
+                { 
+                    runtime: 'tfjs', 
+                    refineLandmarks: true, // Habilita puntos ultra precisos en los ojos e iris
+                    maxFaces: 1 
+                }
+            );
+            
+            loadingPlaceholder.style.display = 'none';
+            calibrationToast.classList.remove('hidden');
+            statusDiv.innerText = "CALIBRANDO...";
+            statusDiv.className = "text-xs bg-blue-500 text-slate-950 px-3 py-1 rounded-full font-bold animate-pulse";
+            
+            detectFace();
+        }
+
+        // Calcular distancia euclidiana tridimensional 
+        function getEuclideanDistance(p1, p2) {
+            return Math.sqrt(Math.pow(p1.x - p2.x, 2) + Math.pow(p1.y - p2.y, 2) + Math.pow(p1.z - p2.z, 2));
+        }
+
+        // 3. Loop de detección en tiempo real de alta eficiencia
+        async function detectFace() {
+            const startTime = performance.now();
+            let predictions = [];
+            
+            try {
+                predictions = await model.estimateFaces(video);
+            } catch(e) {
+                console.error("Fallo de inferencia:", e);
+            }
+
+            if (predictions && predictions.length > 0) {
+                const keypoints = predictions[0].keypoints;
+                
+                // Mapeo simétrico de ambos ojos (MediaPipe Face Mesh Indices)
+                // Ojo Izquierdo
+                const leftSuperior = keypoints[159];
+                const leftInferior = keypoints[145];
+                // Ojo Derecho
+                const rightSuperior = keypoints[386];
+                const rightInferior = keypoints[374];
+                
+                const distLeft = getEuclideanDistance(leftSuperior, leftInferior);
+                const distRight = getEuclideanDistance(rightSuperior, rightInferior);
+                
+                // Promedio combinado de ambos ojos para evitar falsos positivos
+                const currentEyeDistance = (distLeft + distRight) / 2;
+
+                // Fase de auto-calibración inicial dinámica
+                if (calibrationFrames < maxCalibrationFrames) {
+                    calibrationFrames++;
+                    collectedDistances.push(currentEyeDistance);
+                    
+                    if (calibrationFrames === maxCalibrationFrames) {
+                        const averageNormalDistance = collectedDistances.reduce((a,b) => a + b, 0) / collectedDistances.length;
+                        // El umbral crítico se establece de forma inteligente al 65% de la apertura normal del usuario
+                        eyeThreshold = averageNormalDistance * 0.65;
+                        
+                        calibrationToast.classList.add('hidden');
+                        statusDiv.innerText = "SISTEMA ACTIVO";
+                        statusDiv.className = "text-xs bg-emerald-500 text-slate-950 px-3 py-1 rounded-full font-bold";
+                    }
+                } else {
+                    // Evaluación en tiempo real basada en el umbral personalizado
+                    if (currentEyeDistance < eyeThreshold) { 
+                        eyeMetric.innerText = "🛑 CERRADOS";
+                        eyeMetric.className = "text-lg font-extrabold text-red-500 mt-1";
+                        alertOverlay.classList.remove('hidden');
+                        
+                        if (alarmAllowed) {
+                            alarm.play().catch(() => {});
+                        }
+                    } else {
+                        eyeMetric.innerText = "🟢 ABIERTOS";
+                        eyeMetric.className = "text-lg font-extrabold text-emerald-400 mt-1";
+                        alertOverlay.classList.add('hidden');
+                        alarm.pause();
+                        alarm.currentTime = 0;
+                    }
+                }
+            } else {
+                eyeMetric.innerText = "⚠️ NO DETECTADO";
+                eyeMetric.className = "text-lg font-extrabold text-slate-500 mt-1";
+                // Pausar alarma si el usuario no está en frente de la pantalla
+                alertOverlay.classList.add('hidden');
+                alarm.pause();
+            }
+
+            // Cálculo exacto del rendimiento por cuadro
+            const endTime = performance.now();
+            fpsDiv.innerText = `${Math.round(endTime - startTime)} ms`;
+
+            requestAnimationFrame(detectFace);
+        }
+
+        // Arrancar la app al cargar la ventana
+        window.addEventListener('DOMContentLoaded', main);
+    </script>
+</body>
+</html>
